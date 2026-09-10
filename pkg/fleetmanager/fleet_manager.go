@@ -308,7 +308,7 @@ func (efm *EdgegapFleetManager) runCleanupScheduler() {
 	cleanupFn := func() {
 		// Remove the Max Duration to get the expired timestamp of reservations
 		searchTime := time.Now().UTC().Add(-reservationMaxDuration)
-		query := fmt.Sprintf("+value.metadata.edgegap.reservations_count:>0 +value.metadata.edgegap.reservations_updated_at:<\"%s\"", searchTime.Format(time.RFC3339))
+		query := fmt.Sprintf(`+value.metadata.edgegap.reservations_count:>0 +value.metadata.edgegap.reservations_updated_at:<"%s"`, searchTime.Format(time.RFC3339))
 		cursor := ""
 		entries, _, err := efm.nk.StorageIndexList(efm.ctx, "", StorageEdgegapIndex, query, 1_000, nil, cursor)
 		if err != nil {
@@ -317,8 +317,7 @@ func (efm *EdgegapFleetManager) runCleanupScheduler() {
 		}
 
 		results := make([]*runtime.InstanceInfo, 0)
-		objects := entries.GetObjects()
-		if len(objects) > 0 {
+		if objects := entries.GetObjects(); len(objects) > 0 {
 			efm.logger.Debug("Found %d Reservations Instance to cleanup", len(objects))
 			for _, so := range objects {
 				var info *runtime.InstanceInfo
@@ -331,8 +330,13 @@ func (efm *EdgegapFleetManager) runCleanupScheduler() {
 					efm.logger.WithField("error", err.Error()).Error("failed to extract edge gap instance")
 					continue
 				}
+				if info.Status != EdgegapStatusRequested && info.Status != EdgegapStatusRunning {
+					// Skip cleanup of reserved seats for instances in Requested and Running state, to ensure that
+					// the seats aren't removed if the instance takes longer than reservationMaxDuration to be Ready.
+					// Bump reservations_updated_at to give time to players to join the instance once it transitions to Ready.
+					edgegapInstance.Reservations = []string{}
+				}
 				edgegapInstance.ReservationsUpdatedAt = time.Now().UTC()
-				edgegapInstance.Reservations = []string{}
 				info.Metadata["edgegap"] = edgegapInstance
 				results = append(results, info)
 			}

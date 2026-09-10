@@ -1,7 +1,7 @@
 module github.com/edgegap/nakama-edgegap
 
-go 1.26.3
+go 1.26.5
 
-require github.com/heroiclabs/nakama-common v1.46.0
+require github.com/heroiclabs/nakama-common v1.47.0
 
 require google.golang.org/protobuf v1.36.11 // indirect
