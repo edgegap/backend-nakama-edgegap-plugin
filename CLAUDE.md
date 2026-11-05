@@ -57,7 +57,9 @@ go mod vendor
 
 ## Configuration
 
-Required environment variables (set in `local.yml` for local development):
+The Fleet Manager takes an `EdgegapConfig` struct (`configuration.go`), created with `NewEdgegapConfig()` and validated by `NewEdgegapFleetManager`. The package itself never reads environment variables: that is the caller's responsibility, so each namespaced Fleet Manager can have its own configuration. The sample `main.go` (`edgegapConfigFromEnv`) reads these environment variables (set in `local.yml` for local development):
+
+Required:
 - `EDGEGAP_API_URL` - Edgegap API endpoint
 - `EDGEGAP_API_TOKEN` - Authentication token (include "token" prefix)
 - `EDGEGAP_APPLICATION` - Application name on Edgegap
@@ -67,13 +69,21 @@ Required environment variables (set in `local.yml` for local development):
 Optional:
 - `INITIAL_EDGEGAP_VERSION` - Initial version to use if none exists in storage
 - `EDGEGAP_VERSION` - (Deprecated) Falls back to this if `INITIAL_EDGEGAP_VERSION` is not set (for backward compatibility)
+- `EDGEGAP_POLLING_INTERVAL`, `NAKAMA_CLEANUP_INTERVAL` - Worker intervals (default 15m, 1m), empty disables the worker
+- `NAKAMA_RESERVATION_MAX_DURATION` - Seat reservation duration (default 30s)
 
 ### Version Management
-The plugin reads deployment versions from Nakama storage (`system/edgegap_version`). This allows runtime version updates without service restarts. Use the `update_edgegap_version` RPC to change versions dynamically.
+The plugin reads deployment versions from Nakama storage (`system/edgegap_version`, or `system/edgegap_<namespace>_version`). This allows runtime version updates without service restarts. Use the `update_edgegap_version` RPC to change versions dynamically.
 
 On startup, if no version exists in storage and an initial version is configured (via `INITIAL_EDGEGAP_VERSION` or the deprecated `EDGEGAP_VERSION`), it will be automatically stored for immediate use.
 
+## Namespaces
+
+The namespace passed to `Init` (the name given to `RegisterFleetManagerByName()`, empty for `RegisterFleetManager()`) scopes all RPC IDs, the storage collection, the storage index and the version key. The default (empty) namespace keeps the original unprefixed names; a non-empty namespace uses `edgegap_<namespace>_<name>` (see `namespaced()` in `storage.go`). Anything that depends on the namespace is set up in `Init`, not in the constructor, and handlers reference their own `EdgegapFleetManager` rather than `nk.GetFleetManager()` so several fleet managers can coexist.
+
 ## RPC Endpoints
+
+RPC IDs below are for the default namespace.
 
 Client-facing RPCs:
 - `instance_create` - Create new game server instance
@@ -82,9 +92,9 @@ Client-facing RPCs:
 - `instance_join` - Join existing instance
 
 Server-facing RPCs (called by dedicated game servers):
-- `event_deployment` - Deployment status updates
-- `event_connection` - Player connection updates
-- `event_instance` - Instance lifecycle events (READY/ERROR/STOP)
+- `edgegap_deployment_ready`, `edgegap_deployment_error`, `edgegap_deployment_terminated` - Edgegap deployment webhooks
+- `edgegap_connection` - Player connection updates
+- `edgegap_instance` - Instance lifecycle events (READY/ERROR/STOP)
 
 Version management RPCs (S2S only, require HTTP key):
 - `update_edgegap_version` - Update the deployment version
@@ -104,7 +114,7 @@ Version management RPCs (S2S only, require HTTP key):
 
 ### Key Files
 - `dynamic_version_manager.go` - Handles version management and S2S RPCs
-- `configuration.go` - Environment variable configuration with validation
+- `configuration.go` - `EdgegapConfig` struct, defaults and validation
 - `storage.go` - Nakama storage operations with defined error types
 
 ## Testing Approach

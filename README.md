@@ -17,34 +17,59 @@ go get github.com/edgegap/nakama-edgegap
 
 This will add it to your project's `go.mod` dependencies.
 
-## Nakama Setup
+## Configuration
 
-You must set up the following Environment Variable inside your Nakama's cluster:
+The Fleet Manager is configured with an `EdgegapConfig` struct. Create it with `NewEdgegapConfig()`, which takes the required values and sets the defaults of the optional ones:
+
+```go
+cfg := fleetmanager.NewEdgegapConfig(apiUrl, apiToken, application, portName, nakamaAccessUrl)
+cfg.InitialVersion = "v1.0.0"            // optional
+cfg.ReservationMaxDuration = time.Minute // optional
+```
+
+| Field | Description | Default |
+|---|---|---|
+| `ApiUrl` | Edgegap API URL, e.g. `https://api.edgegap.com` | required |
+| `ApiToken` | Edgegap API token, keep the `token` prefix | required |
+| `Application` | Edgegap application to deploy | required |
+| `PortName` | Edgegap application port name to send to game clients | required |
+| `NakamaAccessUrl` | Nakama API URL that deployments call back to, must be prefixed with `https://`. For Heroic Cloud, it is provided when you create your instance | required |
+| `InitialVersion` | Version to store when no version exists in storage, see [Version Management](#version-management) | empty |
+| `PollingInterval` | Interval of the sync with the Edgegap API, in case of mismatch | `15m` |
+| `CleanupInterval` | Interval of the reservation expiry check | `1m` |
+| `ReservationMaxDuration` | Duration of each seat reservation before it expires, see [Seat Reservations](#seat-reservations) | `30s` |
+
+Setting `PollingInterval` or `CleanupInterval` to 0 disables the corresponding background worker entirely. This can be useful for testing purposes but is not recommended for production setting.
+
+`NewEdgegapFleetManager` validates the configuration, including that the application exists on Edgegap, and returns an error if it is invalid.
+
+### Environment Variables
+
+Reading the configuration is up to your plugin. The `main.go` of this project reads it from these environment variables of your Nakama cluster:
+
 ```shell
 EDGEGAP_API_URL=https://api.edgegap.com
 EDGEGAP_API_TOKEN=<The Edgegap's API Token (keep the 'token' in the API Token)>
 EDGEGAP_APPLICATION=<The Edgegap's Application Name to use to deploy>
-INITIAL_EDGEGAP_VERSION=<Initial version to use when no version exists in storage>
 EDGEGAP_PORT_NAME=<The Edgegap's Application Port Name to send to game client>
 NAKAMA_ACCESS_URL=<Nakama API Url, for Heroic Cloud, it will be provided when you create your instance>
 ```
 
-You can copy the `local.yml.example` to `local.yml` and fill it out to start with your local cluster
-
-Make sure the `NAKAMA_ACCESS_URL` is prefixed with `https://`.
-
-Optional Values with default
+Optional values:
 ```shell
-EDGEGAP_POLLING_INTERVAL=<Interval where Nakama will sync with Edgegap API in case of mistmach (default:15m ) >
-NAKAMA_CLEANUP_INTERVAL=<Interval where Nakama will check reservations expiration (default:1m )
-NAKAMA_RESERVATION_MAX_DURATION=<Max Duration of a reservations before it expires (default:30s )
+INITIAL_EDGEGAP_VERSION=<Initial version to use when no version exists in storage, falls back to EDGEGAP_VERSION>
+EDGEGAP_POLLING_INTERVAL=<PollingInterval, empty to disable (default: 15m)>
+NAKAMA_CLEANUP_INTERVAL=<CleanupInterval, empty to disable (default: 1m)>
+NAKAMA_RESERVATION_MAX_DURATION=<ReservationMaxDuration (default: 30s)>
 ```
 
-If `EDGEGAP_POLLING_INTERVAL` or `NAKAMA_CLEANUP_INTERVAL` are set to empty values or 0, the corresponding background workers are disabled entirely. This can be useful for testing purposes but is not recommended for production setting.
+You can copy the `local.yml.example` to `local.yml` and fill it out to start with your local cluster.
 
 ### Version Management
 
 The plugin stores deployment versions in Nakama's storage, allowing you to update the Edgegap deployment version at runtime without restarting services. The version can be updated via Server-to-Server (S2S) RPCs.
+
+The version is stored in the `system` collection under the key `edgegap_version`, or `edgegap_<namespace>_version` for a [namespaced Fleet Manager](#namespace).
 
 On startup, if no version exists in storage and `INITIAL_EDGEGAP_VERSION` is set, the plugin will automatically store this initial version for immediate use
 
@@ -100,13 +125,12 @@ Response (no version set):
 
 **Note**: Both RPCs require HTTP key authentication and cannot be called by game clients.
 
-Using the Nakama's Storage Index and basic struct Instance Info,
-we store extra information in the metadata for Edgegap using 2 list.
-1 list to holds seats reservations
-1 list to holds active connections
+### Per-Deployment Overrides
 
-Using Max Players field we can now create the field `AvailableSeats` that will be in sync with that (
-MaxPlayers-Reservations-Connections=AvailableSeats)
+The `metadata` passed to `Create` can override the global configuration for a single deployment:
+
+- `edgegap_version` - the application version to deploy instead of the version in storage,
+- `edgegap_application` - the Edgegap application to deploy instead of the configured `Application`.
 
 ## Usage
 
@@ -114,7 +138,8 @@ From your `main.go` where the `InitModule` global function is, you need to regis
 
 ```go
 // Register the Fleet Manager
-efm, err := fleetmanager.NewEdgegapFleetManager(ctx, logger, db, nk, initializer)
+cfg := fleetmanager.NewEdgegapConfig(apiUrl, apiToken, application, portName, nakamaAccessUrl)
+efm, err := fleetmanager.NewEdgegapFleetManager(ctx, logger, db, nk, cfg)
 if err != nil {
     return err
 }
@@ -124,6 +149,54 @@ if err = initializer.RegisterFleetManager(efm); err != nil {
     return err
 }
 ```
+
+Once registered, it can be retrieved throughout your plugin code with `nk.GetFleetManager()`.
+
+The plugin must be built with the same `nakama-common` version as the Nakama server that loads it. This version of the Fleet Manager requires Nakama 3.42.0 or later.
+
+### Multiple Fleet Managers
+
+To use more than one Edgegap Fleet Manager from the same Nakama deployment, create each one with its own [configuration](#configuration), e.g. a different Edgegap application, and register it under a distinct name using `RegisterFleetManagerByName()`. The name is used as the Fleet Manager's [namespace](#namespace): it scopes its RPC IDs, storage collection, storage index and deployment version.
+
+```go
+efmEu, err := fleetmanager.NewEdgegapFleetManager(ctx, logger, db, nk, fleetmanager.NewEdgegapConfig(apiUrl, apiToken, "my-game-eu", portName, nakamaAccessUrl))
+if err != nil {
+    return err
+}
+efmUs, err := fleetmanager.NewEdgegapFleetManager(ctx, logger, db, nk, fleetmanager.NewEdgegapConfig(apiUrl, apiToken, "my-game-us", portName, nakamaAccessUrl))
+if err != nil {
+    return err
+}
+
+if err = initializer.RegisterFleetManagerByName("eu", efmEu); err != nil {
+    return err
+}
+if err = initializer.RegisterFleetManagerByName("us", efmUs); err != nil {
+    return err
+}
+```
+
+A Fleet Manager registered by name is retrieved with `nk.GetFleetManagerByName("eu")`.
+
+### Namespace
+
+A Fleet Manager registered with `RegisterFleetManager()` has an empty namespace and uses the names below unprefixed. A Fleet Manager registered with `RegisterFleetManagerByName()` prefixes them with `edgegap_<namespace>_`, where `<namespace>` is the name it was registered with. Namespaced names are always lowercase, so a Fleet Manager registered as `EU` exposes `edgegap_eu_instance_create`.
+
+| Name | Default namespace | Namespace `eu` |
+|---|---|---|
+| Storage collection | `_edgegap_instances` | `edgegap_eu_instances` |
+| Storage index | `_edgegap_instances_idx` | `edgegap_eu_instances_idx` |
+| Version storage key | `edgegap_version` | `edgegap_eu_version` |
+| [Client RPCs](#game-client---nakama-optional-rpc) | `instance_create`, `instance_get`, `instance_list`, `instance_join` | `edgegap_eu_instance_create`, `edgegap_eu_instance_get`, ... |
+| [Version RPCs](#version-management) | `update_edgegap_version`, `get_edgegap_version` | `edgegap_eu_update_version`, `edgegap_eu_get_version` |
+| Edgegap webhooks | `edgegap_deployment_ready`, `edgegap_deployment_error`, `edgegap_deployment_terminated` | `edgegap_eu_deployment_ready`, ... |
+| [Game server events](#dedicated-game-server---nakama-instance) | `edgegap_connection`, `edgegap_instance` | `edgegap_eu_connection`, `edgegap_eu_instance` |
+
+The Edgegap webhook and game server event URLs are passed to each deployment, so they don't need to be configured.
+
+### Upgrading from Nakama 3.41 or earlier
+
+`NewEdgegapFleetManager` no longer takes the `initializer` and no longer reads environment variables: it takes an [`EdgegapConfig`](#configuration) instead. To keep using the same environment variables, copy `edgegapConfigFromEnv` from this project's `main.go`. The RPC IDs and storage names of a Fleet Manager registered with `RegisterFleetManager()` are unchanged.
 
 You can use the `main.go` from this project and also copy the `local.yml.example` to start a local Nakama using docker compose.
 
@@ -137,9 +210,80 @@ Run the following command to stop it
 docker compose down
 ```
 
+## Instances and Seat Reservations
+
+Every Edgegap deployment is tracked as a Nakama Instance, stored in the `_edgegap_instances` collection ([namespaced](#namespace)) and indexed so it can be searched with `List`.
+
+### Instance Status
+
+| Status | Set when |
+|---|---|
+| `REQUESTED` | the deployment was requested from Edgegap |
+| `RUNNING` | Edgegap reports the deployment is ready; the connection info (IP, FQDN, port) is now available |
+| `READY` | the Dedicated Game Server sent the `READY` instance event; the create callback fires |
+| `STOPPING` | the Dedicated Game Server sent the `STOP` instance event |
+| `ERROR` | Edgegap reported a deployment error, or the Dedicated Game Server sent the `ERROR` instance event |
+| `TERMINATED` | Edgegap reports the deployment was terminated; the instance is removed on the next sync |
+
+Edgegap's ready webhook only moves a `REQUESTED` instance to `RUNNING`, so a late webhook can't move a `READY` instance back to `RUNNING`.
+
+When Edgegap's ready webhook includes the deployment location, it is stored in the instance metadata as `site`:
+
+```json
+{ "site": { "city": "Montreal", "latitude": 45.5, "longitude": -73.6 } }
+```
+
+### Seat Reservations
+
+The Edgegap state of an instance lives under `metadata.edgegap`:
+
+| Field | Description |
+|---|---|
+| `max_players` | seat capacity; `0` or less means unlimited |
+| `reservations` | user IDs holding a seat who have not connected yet |
+| `reservation_times` | when each user's seat was reserved |
+| `reservations_updated_at` | time of the oldest outstanding reservation |
+| `reservations_count` | number of reservations |
+| `connections` | user IDs connected to the Dedicated Game Server, as last reported |
+| `available_seats` | `max_players - reservations - connections`, or `-1` when unlimited |
+
+`Create` reserves a seat for each user it is given, and `Join` reserves seats on an existing instance:
+
+- a user who already holds a reservation can join again without taking an extra seat, and their reservation is renewed,
+- `Join` fails with `max players reservation limit reached` when the new users don't fit,
+- on an unlimited instance `Join` always succeeds and no reservations are tracked.
+
+A reservation ends when:
+
+- the user appears in a [Connection Event](#connection-events), moving them from `reservations` to `connections`,
+- the reservation is older than the configured `ReservationMaxDuration`, checked every `CleanupInterval`. Connection events do not renew the remaining reservations, so a player who never connects frees their seat even while the server keeps reporting. While the instance is still `REQUESTED` or `RUNNING`, expired reservations are renewed instead of dropped, so players don't lose their seat when the server takes longer to start,
+- the seat is released with [`Leave`](#additional-fleet-manager-methods).
+
+All instance updates use versioned storage writes, so concurrent joins, connection events and cleanups can't overwrite each other.
+
+### Additional Fleet Manager Methods
+
+Besides the `runtime.FleetManager` interface, `EdgegapFleetManager` provides:
+
+- `Leave(ctx, id, userIds)` - releases the reservations held by `userIds`, e.g. when a party abandons a server before connecting. Unknown instances are ignored,
+- `Update(ctx, id, playerCount, metadata)` - merges `metadata` into the instance metadata; the `edgegap` key can't be overwritten. `playerCount` is not stored, because the player count always comes from the connection events,
+- `Delete(ctx, id)` - stops the Edgegap deployment and removes the instance.
+
+Use the `*EdgegapFleetManager` returned by `NewEdgegapFleetManager`, or type-assert the registered fleet manager (use `GetFleetManagerByName()` for a namespaced one):
+
+```go
+efm, ok := nk.GetFleetManager().(*fleetmanager.EdgegapFleetManager)
+if !ok {
+    return errors.New("edgegap fleet manager not registered")
+}
+if err := efm.Leave(ctx, instanceId, userIds); err != nil {
+    return err
+}
+```
+
 ## Server Placement
 
-Game clients only interact with Edgegap APIs through Nakama RPCs, defaulting to [Nakama authentication method of your choice](https://heroiclabs.com/docs/nakama/concepts/authentication/). [Edgegap's Server Placement utilizing Server Score strategy](https://docs.edgegap.com/learn/advanced-features/deployments#1-server-score-strategy-best-practice) uses public IP addresses of participating players to choose the optimal server location. To store the player IP address and pass it to Edgegap when looking for server, store player's public IP in their Profile's Metadata as `PlayerIP`.
+Game clients only interact with Edgegap APIs through Nakama RPCs, defaulting to [Nakama authentication method of your choice](https://heroiclabs.com/docs/nakama/concepts/authentication/). [Edgegap's Server Placement utilizing Server Score strategy](https://docs.edgegap.com/learn/advanced-features/deployments#1-server-score-strategy-best-practice) uses public IP addresses of participating players to choose the optimal server location. To store the player IP address and pass it to Edgegap when looking for server, store player's public IP in their Profile's Metadata as `PlayerIp`. Users without one are left out of placement; if none of the users has one, the IP address of the caller is used.
 
 In your `main.go`, during the Init you can add the Registration of the Authentication of the type you implemented
 
@@ -150,7 +294,7 @@ In your `main.go`, during the Init you can add the Registration of the Authentic
     }
 ```
 
-This will automatically store in Profile's Metadata the `PlayerIP`
+This will automatically store in Profile's Metadata the `PlayerIp`
 
 ## Dedicated Game Server -> Nakama Instance
 
@@ -173,6 +317,7 @@ The following Environment Variables will be available in the Dedicated Game Serv
 - `NAKAMA_CONNECTION_EVENT_URL` (url to send connection events of the players)
 - `NAKAMA_INSTANCE_EVENT_URL` (url to send instance event actions)
 - `NAKAMA_INSTANCE_METADATA` (contains create metadata JSON)
+- `NAKAMA_EDGEGAP_NAMESPACE` (the [namespace](#namespace) of the Fleet Manager that created the deployment, empty by default)
 
 ### Connection Events
 
@@ -189,7 +334,8 @@ Using `NAKAMA_CONNECTION_EVENT_URL` you must send Player Connection events to th
 
 `connections` is the list of active user IDs connected to the Dedicated Game Server. We recommend collecting updates
 over a short period of time (~5 seconds) and updating the full list of connections in a batch request. Contents of
-this request will overwrite any existing list of connections for the specified instance.
+this request will overwrite any existing list of connections for the specified instance, and release the seat reservations of
+the listed users. The instance `player_count` is the number of connections.
 
 ### Instance Events
 
@@ -217,6 +363,7 @@ Using `NAKAMA_INSTANCE_EVENT_URL` you must send Instance events to the Nakama In
 ## Game Client -> Nakama (optional rpc)
 
 We included a Client RPC route to do basic operations on Instance - listing, creating, and joining. Consider this an optional starter code sample.
+The RPC IDs below are for the default namespace; a [namespaced Fleet Manager](#namespace) registers them as `edgegap_<namespace>_instance_create`, and so on.
 For production/live use cases, we recommend using a matchmaker for added security and flexibility.
 
 ### Create Instance
@@ -231,7 +378,9 @@ RPC - instance_create
 }
 ```
 
-`max_players` to -1 for unlimited. Use with caution, we recommend performing a benchmark for server resource usage impact.
+Set `max_players` to `0` or `-1` for unlimited. Use with caution, we recommend performing a benchmark for server resource usage impact.
+
+`metadata` can include the [per-deployment overrides](#per-deployment-overrides) `edgegap_version` and `edgegap_application`.
 
 If `user_ids` is empty, the requesting user's ID will be used.
 
@@ -349,7 +498,10 @@ func OnMatchmakerMatched(ctx context.Context, logger runtime.Logger, db *sql.DB,
 	}
 	
 	efm := nk.GetFleetManager()
-	err := efm.Create(ctx, maxPlayers, userIds, nil, nil, callback)
+	if _, err := efm.Create(ctx, maxPlayers, userIds, nil, nil, callback); err != nil {
+		logger.WithField("error", err.Error()).Error("failed to create Edgegap instance")
+		return "", ErrInternalError
+	}
 
 	reply := instanceCreateReply{
 		Message: "Instance Created",
@@ -362,7 +514,7 @@ func OnMatchmakerMatched(ctx context.Context, logger runtime.Logger, db *sql.DB,
 		return "", ErrInternalError
 	}
 
-	return string(replyString), err
+	return string(replyString), nil
 }
 ```
 
