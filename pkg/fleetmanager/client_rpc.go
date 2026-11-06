@@ -8,11 +8,12 @@ import (
 	"github.com/heroiclabs/nakama-common/runtime"
 )
 
-const (
-	RpcIdInstanceSessionList   = "instance_list"
-	RpcIdInstanceSessionGet    = "instance_get"
-	RpcIdInstanceSessionCreate = "instance_create"
-	RpcIdInstanceSessionJoin   = "instance_join"
+// Client RPC IDs are scoped to the namespace the Fleet Manager was registered with.
+var (
+	RpcIdInstanceSessionList   = func(namespace string) string { return namespaced(namespace, "instance_list", "instance_list") }
+	RpcIdInstanceSessionGet    = func(namespace string) string { return namespaced(namespace, "instance_get", "instance_get") }
+	RpcIdInstanceSessionCreate = func(namespace string) string { return namespaced(namespace, "instance_create", "instance_create") }
+	RpcIdInstanceSessionJoin   = func(namespace string) string { return namespaced(namespace, "instance_join", "instance_join") }
 )
 
 const (
@@ -54,7 +55,7 @@ type instanceCreateReply struct {
 }
 
 // createInstanceSession client rpc to create an instance
-func createInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (efm *EdgegapFleetManager) createInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 	userId, ok := ctx.Value(runtime.RUNTIME_CTX_USER_ID).(string)
 	if !ok {
 		return "", ErrInvalidInput
@@ -124,7 +125,6 @@ func createInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.D
 		}
 	}
 
-	efm := nk.GetFleetManager()
 	metadata, err := efm.Create(ctx, req.MaxPlayers, req.UserIds, nil, req.Metadata, callback)
 	if err != nil {
 		logger.WithField("error", err.Error()).Error("Failed to create Edgegap instance")
@@ -148,14 +148,13 @@ func createInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.D
 }
 
 // getInstanceSession client rpc to retrieve the instance info of a instance
-func getInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (efm *EdgegapFleetManager) getInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 	var req *getInstanceSessionRequest
 	if err := json.Unmarshal([]byte(payload), &req); err != nil {
 		logger.WithField("error", err.Error()).Error("failed to unmarshal get Request")
 		return "", ErrInternalError
 	}
 
-	efm := nk.GetFleetManager()
 	instance, err := efm.Get(ctx, req.InstanceID)
 	if err != nil {
 		return "", err
@@ -171,7 +170,7 @@ func getInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, 
 }
 
 // joinInstanceSession client rpc to join a instance with seats reservations
-func joinInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (efm *EdgegapFleetManager) joinInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 	userId, ok := ctx.Value(runtime.RUNTIME_CTX_USER_ID).(string)
 	if !ok {
 		return "", ErrInvalidInput
@@ -187,7 +186,6 @@ func joinInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB,
 		req.UserIds = []string{userId}
 	}
 
-	efm := nk.GetFleetManager()
 	joinInfo, err := efm.Join(ctx, req.InstanceID, req.UserIds, nil)
 	if err != nil {
 		return "", err
@@ -205,7 +203,7 @@ func joinInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB,
 // listInstanceSession client rpc to list instances with query
 // Example to list all ready instances with at least 1 available seat
 // query="+value.metadata.edgegap.available_seats:>=1 +value.status:READY"
-func listInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (efm *EdgegapFleetManager) listInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 
 	var req *findInstanceSessionRequest
 	if payload != "" {
@@ -219,7 +217,6 @@ func listInstanceSession(ctx context.Context, logger runtime.Logger, db *sql.DB,
 		}
 	}
 
-	efm := nk.GetFleetManager()
 	instances, cursor, err := efm.List(ctx, req.Query, req.Limit, req.Cursor)
 	if err != nil {
 		logger.WithField("error", err.Error()).Error("failed to list instance instances")

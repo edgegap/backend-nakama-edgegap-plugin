@@ -4,21 +4,47 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/edgegap/nakama-edgegap/internal/helpers"
+	"github.com/heroiclabs/nakama-common/api"
 	"github.com/heroiclabs/nakama-common/runtime"
 )
 
-// ErrorNoVersionFound is returned when no Edgegap version is found in storage
-var ErrorNoVersionFound = errors.New("no Edgegap version found in storage")
+var (
+	// ErrorNoVersionFound is returned when no Edgegap version is found in storage
+	ErrorNoVersionFound        = errors.New("no Edgegap version found in storage")
+	ErrInstanceNotFound        = errors.New("instance not found")
+	ErrReservationLimitReached = errors.New("max players reservation limit reached")
 
-// Constants for storage collection and index names
-const (
-	StorageEdgegapIndex               = "_edgegap_instances_idx"
-	StorageEdgegapInstancesCollection = "_edgegap_instances"
-	StorageCollectionEdgegapVersion   = "system"
-	StorageKeyEdgegapVersion          = "edgegap_version"
+	// errInstanceUnchanged lets a mutation skip the write; MutateInstance then returns the record as read.
+	errInstanceUnchanged = errors.New("instance unchanged")
 )
+
+const StorageCollectionEdgegapVersion = "system"
+
+// Storage names are scoped to the namespace the Fleet Manager was registered with.
+var (
+	StorageEdgegapIndex = func(namespace string) string {
+		return namespaced(namespace, "_edgegap_instances_idx", "instances_idx")
+	}
+	StorageEdgegapInstancesCollection = func(namespace string) string {
+		return namespaced(namespace, "_edgegap_instances", "instances")
+	}
+	StorageKeyEdgegapVersion = func(namespace string) string { return namespaced(namespace, "edgegap_version", "version") }
+)
+
+// namespaced returns defaultName for the default (empty) namespace, so a single Fleet Manager keeps its
+// existing names, and otherwise prefixes name with "edgegap_<namespace>_". Names are lowercased to match
+// how Nakama registers and resolves RPC IDs.
+func namespaced(namespace, defaultName, name string) string {
+	if namespace == "" {
+		return defaultName
+	}
+	return strings.ToLower("edgegap_" + namespace + "_" + name)
+}
 
 // Constants representing different statuses of an Edgegap instance
 const (
@@ -33,16 +59,28 @@ const (
 
 // StorageManager handles interactions with Nakama's storage system
 type StorageManager struct {
-	nk     runtime.NakamaModule
-	logger runtime.Logger
+	nk           runtime.NakamaModule
+	logger       runtime.Logger
+	collection   string
+	index        string
+	namespaceKey string
 }
 
 // NewStorageManager creates a new StorageManager instance
 func NewStorageManager(nk runtime.NakamaModule, logger runtime.Logger) *StorageManager {
-	return &StorageManager{
+	sm := &StorageManager{
 		nk:     nk,
 		logger: logger,
 	}
+	sm.setNamespace("")
+	return sm
+}
+
+// setNamespace scopes the storage collection, index and version key to the Fleet Manager namespace.
+func (sm *StorageManager) setNamespace(namespace string) {
+	sm.collection = StorageEdgegapInstancesCollection(namespace)
+	sm.index = StorageEdgegapIndex(namespace)
+	sm.namespaceKey = StorageKeyEdgegapVersion(namespace)
 }
 
 // ExtractEdgegapInstance extracts Edgegap-related data from an instance's metadata.
@@ -80,6 +118,22 @@ func (sm *StorageManager) SyncInstance(instance *runtime.InstanceInfo) error {
 	availableSeat, err := sm.GetAvailableSeat(instance)
 	if err != nil {
 		return err
+	}
+
+	// Keep exactly one reservation time per reserved user, and expose the oldest one as
+	// reservations_updated_at so the cleanup index query finds every instance with an expired seat.
+	reservationTimes := make(map[string]time.Time, len(edgegapInstance.Reservations))
+	var oldest time.Time
+	for _, userId := range edgegapInstance.Reservations {
+		t := edgegapInstance.reservedAt(userId).UTC()
+		reservationTimes[userId] = t
+		if oldest.IsZero() || t.Before(oldest) {
+			oldest = t
+		}
+	}
+	edgegapInstance.ReservationTimes = reservationTimes
+	if !oldest.IsZero() {
+		edgegapInstance.ReservationsUpdatedAt = oldest
 	}
 
 	// Update player count and available seats
@@ -124,7 +178,7 @@ func (sm *StorageManager) WriteEdgegapVersion(ctx context.Context, version strin
 	if _, err := sm.nk.StorageWrite(ctx, []*runtime.StorageWrite{
 		{
 			Collection:      StorageCollectionEdgegapVersion,
-			Key:             StorageKeyEdgegapVersion,
+			Key:             sm.namespaceKey,
 			Value:           string(versionDataBytes),
 			PermissionRead:  2, // Public read
 			PermissionWrite: 0, // No write from clients
@@ -141,7 +195,7 @@ func (sm *StorageManager) ReadEdgegapVersion(ctx context.Context) (string, int64
 	objects, err := sm.nk.StorageRead(ctx, []*runtime.StorageRead{
 		{
 			Collection: StorageCollectionEdgegapVersion,
-			Key:        StorageKeyEdgegapVersion,
+			Key:        sm.namespaceKey,
 		},
 	})
 
@@ -179,11 +233,18 @@ func (sm *StorageManager) createDbInstance(ctx context.Context, id string, maxPl
 		metadata = make(map[string]any)
 	}
 
+	now := time.Now().UTC()
+	reservationTimes := make(map[string]time.Time, len(userIds))
+	for _, userId := range userIds {
+		reservationTimes[userId] = now
+	}
+
 	// Store Edgegap-related information in metadata
 	metadata["edgegap"] = EdgegapInstanceInfo{
 		MaxPlayers:            maxPlayers,
 		Reservations:          userIds,
-		ReservationsUpdatedAt: time.Now(),
+		ReservationsUpdatedAt: now,
+		ReservationTimes:      reservationTimes,
 		CallbackId:            callbackId,
 		Connections:           []string{},
 	}
@@ -211,7 +272,7 @@ func (sm *StorageManager) createDbInstance(ctx context.Context, id string, maxPl
 	}
 
 	sw := runtime.StorageWrite{
-		Collection: StorageEdgegapInstancesCollection,
+		Collection: sm.collection,
 		Key:        id,
 		UserID:     "",
 		Value:      string(value),
@@ -228,7 +289,7 @@ func (sm *StorageManager) listDbInstances(ctx context.Context) ([]*runtime.Insta
 
 	// Loop to fetch sessions in batches
 	for {
-		objects, nextCursor, err := sm.nk.StorageList(ctx, "", "", StorageEdgegapInstancesCollection, 1_000, cursor)
+		objects, nextCursor, err := sm.nk.StorageList(ctx, "", "", sm.collection, 1_000, cursor)
 		if err != nil {
 			return nil, err
 		}
@@ -255,7 +316,7 @@ func (sm *StorageManager) listDbInstances(ctx context.Context) ([]*runtime.Insta
 // getDbInstance retrieves a single instance by ID from the Nakama database.
 func (sm *StorageManager) getDbInstance(ctx context.Context, id string) (*runtime.InstanceInfo, error) {
 	objects, err := sm.nk.StorageRead(ctx, []*runtime.StorageRead{{
-		Collection: StorageEdgegapInstancesCollection,
+		Collection: sm.collection,
 		Key:        id,
 	}})
 	if err != nil {
@@ -278,59 +339,6 @@ func (sm *StorageManager) getDbInstance(ctx context.Context, id string) (*runtim
 	return instance, nil
 }
 
-// updateDbInstance updates an existing instance in the database.
-func (sm *StorageManager) updateDbInstance(ctx context.Context, instance *runtime.InstanceInfo) error {
-	// Sync instance metadata before updating storage
-	err := sm.SyncInstance(instance)
-	if err != nil {
-		return err
-	}
-
-	// Serialize instance data to JSON
-	value, err := json.Marshal(instance)
-	if err != nil {
-		return err
-	}
-
-	// Write updated instance to storage
-	sw := runtime.StorageWrite{
-		Collection: StorageEdgegapInstancesCollection,
-		Key:        instance.Id,
-		UserID:     "",
-		Value:      string(value),
-	}
-	_, err = sm.nk.StorageWrite(ctx, []*runtime.StorageWrite{&sw})
-	return err
-}
-
-// updateDbInstances updates multiple instance in the database
-func (sm *StorageManager) updateManyDbInstance(ctx context.Context, instances []*runtime.InstanceInfo) error {
-	writes := make([]*runtime.StorageWrite, 0, len(instances))
-	for _, instance := range instances {
-		err := sm.SyncInstance(instance)
-		if err != nil {
-			sm.logger.Error("Error syncing instance %v: %v", instance.Id, err)
-			continue
-		}
-		// Serialize instance data to JSON
-		value, err := json.Marshal(instance)
-		if err != nil {
-			return err
-		}
-
-		// Append for Batch Writes
-		writes = append(writes, &runtime.StorageWrite{
-			Collection: StorageEdgegapInstancesCollection,
-			Key:        instance.Id,
-			UserID:     "",
-			Value:      string(value),
-		})
-	}
-
-	_, err := sm.nk.StorageWrite(ctx, writes)
-	return err
-}
-
 // deleteDbInstance removes instance from Nakama storage.
 func (sm *StorageManager) deleteDbInstance(ctx context.Context, ids []string) error {
 	deletes := make([]*runtime.StorageDelete, 0, len(ids))
@@ -338,7 +346,7 @@ func (sm *StorageManager) deleteDbInstance(ctx context.Context, ids []string) er
 	// Prepare delete requests for each session ID
 	for _, id := range ids {
 		deletes = append(deletes, &runtime.StorageDelete{
-			Collection: StorageEdgegapInstancesCollection,
+			Collection: sm.collection,
 			Key:        id,
 		})
 	}
@@ -381,4 +389,196 @@ func (sm *StorageManager) getUserIPs(ctx context.Context, userIds []string) ([]s
 	}
 
 	return userIps, nil
+}
+
+// instanceWriteMaxRetries bounds the retries of MutateInstance on concurrent writes.
+const instanceWriteMaxRetries = 5
+
+// MutateInstance mutates the stored record and writes it back with the version it was read
+// at. On a concurrent write the record is re-read and mutate runs again on the fresh copy.
+func (sm *StorageManager) MutateInstance(ctx context.Context, id string, mutate func(instance *runtime.InstanceInfo) error) (*runtime.InstanceInfo, error) {
+	var result *runtime.InstanceInfo
+	reads := []*runtime.StorageRead{{Collection: sm.collection, Key: id}}
+	_, err := sm.nk.StorageWriteRetry(ctx, reads, func(objects []*api.StorageObject) ([]*runtime.StorageWrite, error) {
+		if len(objects) == 0 {
+			return nil, ErrInstanceNotFound
+		}
+
+		var instance *runtime.InstanceInfo
+		if err := json.Unmarshal([]byte(objects[0].Value), &instance); err != nil {
+			return nil, err
+		}
+		result = instance
+
+		if err := mutate(instance); err != nil {
+			return nil, err
+		}
+		if err := sm.SyncInstance(instance); err != nil {
+			return nil, err
+		}
+
+		value, err := json.Marshal(instance)
+		if err != nil {
+			return nil, err
+		}
+		return []*runtime.StorageWrite{{
+			Collection: sm.collection,
+			Key:        id,
+			UserID:     "",
+			Value:      string(value),
+			Version:    objects[0].Version,
+		}}, nil
+	}, instanceWriteMaxRetries)
+	if errors.Is(err, errInstanceUnchanged) {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ReserveSeats adds userIds to the reservations when they fit, and renews the reservation of users
+// already holding one. An unlimited instance (max_players <= 0) seats everyone without a write.
+func (sm *StorageManager) ReserveSeats(instance *runtime.InstanceInfo, userIds []string) error {
+	edgegapInstance, err := sm.ExtractEdgegapInstance(instance)
+	if err != nil {
+		return errors.New("error extracting Edgegap instance")
+	}
+
+	if edgegapInstance.MaxPlayers <= 0 {
+		return errInstanceUnchanged
+	}
+
+	// Only users without a reservation take up a new seat.
+	newSeats := make([]string, 0, len(userIds))
+	for _, userId := range userIds {
+		if !slices.Contains(edgegapInstance.Reservations, userId) {
+			newSeats = helpers.AppendIfNotExists(newSeats, userId)
+		}
+	}
+	if instance.PlayerCount+len(edgegapInstance.Reservations)+len(newSeats) > edgegapInstance.MaxPlayers {
+		return ErrReservationLimitReached
+	}
+
+	now := time.Now().UTC()
+	if edgegapInstance.ReservationTimes == nil {
+		edgegapInstance.ReservationTimes = make(map[string]time.Time, len(userIds))
+	}
+	for _, userId := range userIds {
+		edgegapInstance.Reservations = helpers.AppendIfNotExists(edgegapInstance.Reservations, userId)
+		edgegapInstance.ReservationTimes[userId] = now
+	}
+	instance.Metadata["edgegap"] = edgegapInstance
+	return nil
+}
+
+// ReleaseSeats drops the reservations held for userIds. Connected players are no longer reserved, so
+// passing them is harmless.
+func (sm *StorageManager) ReleaseSeats(instance *runtime.InstanceInfo, userIds []string) error {
+	edgegapInstance, err := sm.ExtractEdgegapInstance(instance)
+	if err != nil {
+		return errors.New("error extracting Edgegap instance")
+	}
+
+	remaining := helpers.RemoveElements(edgegapInstance.Reservations, userIds)
+	if len(remaining) == len(edgegapInstance.Reservations) {
+		return errInstanceUnchanged
+	}
+	edgegapInstance.Reservations = remaining
+	instance.Metadata["edgegap"] = edgegapInstance
+	return nil
+}
+
+// MergeMetadata merges metadata into the instance metadata. The edgegap key is owned by the fleet
+// manager and is never overwritten.
+func (sm *StorageManager) MergeMetadata(instance *runtime.InstanceInfo, metadata map[string]any) error {
+	if len(metadata) == 0 {
+		return errInstanceUnchanged
+	}
+	merged := helpers.MergeMaps(instance.Metadata, metadata)
+	if edgegapInstance, ok := instance.Metadata["edgegap"]; ok {
+		merged["edgegap"] = edgegapInstance
+	} else {
+		delete(merged, "edgegap")
+	}
+	instance.Metadata = merged
+	return nil
+}
+
+// ApplyConnectionReport is the game server's heartbeat: reported users move from the reservations to
+// the connections.
+func (sm *StorageManager) ApplyConnectionReport(instance *runtime.InstanceInfo, connections []string) error {
+	edgegapInstance, err := sm.ExtractEdgegapInstance(instance)
+	if err != nil {
+		return err
+	}
+
+	// The report does not renew the remaining reservations: a no-show still expires on its own reservation time.
+	edgegapInstance.Reservations = helpers.RemoveElements(edgegapInstance.Reservations, connections)
+	edgegapInstance.Connections = connections
+	instance.Metadata["edgegap"] = edgegapInstance
+	return nil
+}
+
+// ExpireReservations drops the reservations made before cutoff. While the instance is still Requested
+// or Running the seats are kept and renewed instead, so they aren't removed if the instance takes
+// longer than the reservation duration to be Ready, and players get time to join once it is.
+func (sm *StorageManager) ExpireReservations(instance *runtime.InstanceInfo, cutoff time.Time) error {
+	edgegapInstance, err := sm.ExtractEdgegapInstance(instance)
+	if err != nil {
+		return err
+	}
+
+	expired := make([]string, 0)
+	for _, userId := range edgegapInstance.Reservations {
+		if edgegapInstance.reservedAt(userId).Before(cutoff) {
+			expired = append(expired, userId)
+		}
+	}
+	if len(expired) == 0 {
+		return errInstanceUnchanged
+	}
+
+	if instance.Status == EdgegapStatusRequested || instance.Status == EdgegapStatusRunning {
+		now := time.Now().UTC()
+		if edgegapInstance.ReservationTimes == nil {
+			edgegapInstance.ReservationTimes = make(map[string]time.Time, len(expired))
+		}
+		for _, userId := range expired {
+			edgegapInstance.ReservationTimes[userId] = now
+		}
+	} else {
+		edgegapInstance.Reservations = helpers.RemoveElements(edgegapInstance.Reservations, expired)
+	}
+	instance.Metadata["edgegap"] = edgegapInstance
+	return nil
+}
+
+// ApplyDeploymentReady is Edgegap's ready webhook: the deployment is RUNNING at the reported address,
+// and its location replaces the site the create wrote.
+func (sm *StorageManager) ApplyDeploymentReady(instance *runtime.InstanceInfo, deployment *EdgegapDeploymentStatus, portName string, logger runtime.Logger) error {
+	// A late webhook must not move an instance the game server already reported on back to RUNNING.
+	if instance.Status == EdgegapStatusRequested {
+		instance.Status = EdgegapStatusRunning
+	}
+	instance.ConnectionInfo = &runtime.ConnectionInfo{
+		IpAddress: deployment.PublicIp,
+		DnsName:   deployment.Fqdn,
+		Port:      deployment.Ports[portName].External,
+	}
+
+	if instance.Metadata == nil {
+		instance.Metadata = map[string]any{}
+	}
+	if deployment.Location.Latitude != 0 || deployment.Location.Longitude != 0 {
+		instance.Metadata["site"] = map[string]any{
+			"city":      deployment.Location.City,
+			"latitude":  deployment.Location.Latitude,
+			"longitude": deployment.Location.Longitude,
+		}
+	} else {
+		logger.Warn("Edgegap deployment ready #%s without a location, keeping the existing site metadata", deployment.RequestId)
+	}
+	return nil
 }

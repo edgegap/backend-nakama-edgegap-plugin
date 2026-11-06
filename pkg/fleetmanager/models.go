@@ -3,13 +3,24 @@ package fleetmanager
 import "time"
 
 type EdgegapInstanceInfo struct {
-	MaxPlayers            int       `json:"max_players"`
-	AvailableSeats        int       `json:"available_seats"`
-	CallbackId            string    `json:"callback_id"`
-	Reservations          []string  `json:"reservations"`
-	ReservationsCount     int       `json:"reservations_count"`
-	ReservationsUpdatedAt time.Time `json:"reservations_updated_at"`
-	Connections           []string  `json:"connections"`
+	MaxPlayers        int      `json:"max_players"`
+	AvailableSeats    int      `json:"available_seats"`
+	CallbackId        string   `json:"callback_id"`
+	Reservations      []string `json:"reservations"`
+	ReservationsCount int      `json:"reservations_count"`
+	// ReservationsUpdatedAt is the time of the oldest outstanding reservation, kept in sync with ReservationTimes.
+	ReservationsUpdatedAt time.Time            `json:"reservations_updated_at"`
+	ReservationTimes      map[string]time.Time `json:"reservation_times,omitempty"`
+	Connections           []string             `json:"connections"`
+}
+
+// reservedAt returns when userId's seat was reserved. Reservations stored before per-user times
+// existed fall back to the instance-wide timestamp.
+func (ei *EdgegapInstanceInfo) reservedAt(userId string) time.Time {
+	if t, ok := ei.ReservationTimes[userId]; ok {
+		return t
+	}
+	return ei.ReservationsUpdatedAt
 }
 
 type EdgegapUserData struct {
@@ -50,6 +61,12 @@ type EdgegapDeploymentPort struct {
 	Link     string `json:"link"`
 }
 
+type EdgegapDeploymentLocation struct {
+	City      string  `json:"city"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
 type EdgegapDeploymentStatus struct {
 	RequestId     string                           `json:"request_id"`
 	Fqdn          string                           `json:"fqdn"`
@@ -59,6 +76,7 @@ type EdgegapDeploymentStatus struct {
 	Error         bool                             `json:"error"`
 	ErrorDetail   string                           `json:"error_detail"`
 	Ports         map[string]EdgegapDeploymentPort `json:"ports"`
+	Location      EdgegapDeploymentLocation        `json:"location"`
 }
 
 type EdgegapDeploymentResponse struct {
