@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -391,9 +392,6 @@ func (sm *StorageManager) getUserIPs(ctx context.Context, userIds []string) ([]s
 	return userIps, nil
 }
 
-// instanceWriteMaxRetries bounds the retries of MutateInstance on concurrent writes.
-const instanceWriteMaxRetries = 5
-
 // MutateInstance mutates the stored record and writes it back with the version it was read
 // at. On a concurrent write the record is re-read and mutate runs again on the fresh copy.
 func (sm *StorageManager) MutateInstance(ctx context.Context, id string, mutate func(instance *runtime.InstanceInfo) error) (*runtime.InstanceInfo, error) {
@@ -428,7 +426,7 @@ func (sm *StorageManager) MutateInstance(ctx context.Context, id string, mutate 
 			Value:      string(value),
 			Version:    objects[0].Version,
 		}}, nil
-	}, instanceWriteMaxRetries)
+	}, 5)
 	if errors.Is(err, errInstanceUnchanged) {
 		return result, nil
 	}
@@ -436,6 +434,63 @@ func (sm *StorageManager) MutateInstance(ctx context.Context, id string, mutate 
 		return nil, err
 	}
 	return result, nil
+}
+
+// MutateInstances mutates records already read, from an index query for example, and writes them in one
+// batch with the versions they were read at. Nakama rejects the whole batch on a concurrent write without
+// saying which record changed, so on a conflict the whole batch is re-read, mutated and written again.
+func (sm *StorageManager) MutateInstances(ctx context.Context, objects []*api.StorageObject, mutate func(instance *runtime.InstanceInfo) error) error {
+	for attempt := 0; ; attempt++ {
+		writes := make([]*runtime.StorageWrite, 0, len(objects))
+		for _, so := range objects {
+			var instance *runtime.InstanceInfo
+			if err := json.Unmarshal([]byte(so.Value), &instance); err != nil {
+				return fmt.Errorf("failed to unmarshal instance %s: %w", so.Key, err)
+			}
+			if err := mutate(instance); err != nil {
+				if errors.Is(err, errInstanceUnchanged) {
+					continue
+				}
+				return fmt.Errorf("failed to mutate instance %s: %w", so.Key, err)
+			}
+			if err := sm.SyncInstance(instance); err != nil {
+				return fmt.Errorf("failed to sync instance %s: %w", so.Key, err)
+			}
+			value, err := json.Marshal(instance)
+			if err != nil {
+				return fmt.Errorf("failed to marshal instance %s: %w", so.Key, err)
+			}
+			writes = append(writes, &runtime.StorageWrite{
+				Collection: sm.collection,
+				Key:        so.Key,
+				UserID:     "",
+				Value:      string(value),
+				Version:    so.Version,
+			})
+		}
+		if len(writes) == 0 {
+			return nil
+		}
+
+		_, err := sm.nk.StorageWrite(ctx, writes)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, runtime.ErrStorageRejectedVersion) {
+			return fmt.Errorf("failed to write %d instances: %w", len(writes), err)
+		}
+		if attempt >= 5 {
+			return fmt.Errorf("failed to write %d instances after %d retries on concurrent writes: %w", len(writes), attempt, err)
+		}
+
+		reads := make([]*runtime.StorageRead, 0, len(objects))
+		for _, so := range objects {
+			reads = append(reads, &runtime.StorageRead{Collection: sm.collection, Key: so.Key})
+		}
+		if objects, err = sm.nk.StorageRead(ctx, reads); err != nil {
+			return fmt.Errorf("failed to re-read %d instances after a concurrent write: %w", len(reads), err)
+		}
+	}
 }
 
 // ReserveSeats adds userIds to the reservations when they fit, and renews the reservation of users

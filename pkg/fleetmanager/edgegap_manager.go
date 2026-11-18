@@ -17,8 +17,6 @@ import (
 const (
 	// Metadata key for per-deployment Edgegap version override
 	MetadataEdgegapVersionKey = "edgegap_version"
-	// Metadata key for per-deployment Edgegap application override
-	MetadataEdgegapApplicationKey = "edgegap_application"
 
 	// Error messages
 	ErrorMessageNoVersionFound = "no Edgegap version found - please set version using %s RPC or provide INITIAL_EDGEGAP_VERSION"
@@ -166,14 +164,9 @@ func (em *EdgegapManager) getDeploymentCreation(usersIP []string, metadata map[s
 		}
 	}
 
-	application := em.configuration.Application
-	if a, ok := metadata[MetadataEdgegapApplicationKey].(string); ok && a != "" {
-		application = a
-	}
-
 	// Construct deployment request payload
 	return &EdgegapDeploymentCreation{
-		Application: application,
+		Application: em.configuration.Application,
 		Version:     version,
 		Users:       users,
 		EnvironmentVariables: []EdgegapEnvironmentVariable{

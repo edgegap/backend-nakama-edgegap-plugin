@@ -225,13 +225,13 @@ func (efm *EdgegapFleetManager) Delete(ctx context.Context, id string) error {
 
 func (efm *EdgegapFleetManager) syncInstancesWorker() {
 	deleteTerminatedInstancesFn := func() {
+		listedAt := time.Now()
 		deployments, err := efm.edgegapManager.ListAllDeployments()
 		if err != nil {
 			efm.logger.WithField("error", err.Error()).Error("failed to list edgegap deployments")
 			return
 		}
 		efm.logger.WithField("active_deployments", len(deployments)).Debug("fetched active deployment instances list")
-		efm.nk.MetricsGaugeSet("edgegap_deployment_count", nil, float64(len(deployments)))
 
 		dbInstances, err := efm.storageManager.listDbInstances(efm.ctx)
 		if err != nil {
@@ -246,12 +246,19 @@ func (efm *EdgegapFleetManager) syncInstancesWorker() {
 			}
 		}
 
+		activeCount := 0
 		instancesToRemove := make([]string, 0)
 		for _, dbInfo := range dbInstances {
-			if _, ok := activeInstancesMap[dbInfo.Id]; !ok {
+			if _, ok := activeInstancesMap[dbInfo.Id]; ok {
+				activeCount++
+				continue
+			}
+			// An instance created after the listing started may not be in it yet.
+			if dbInfo.CreateTime.Before(listedAt) {
 				instancesToRemove = append(instancesToRemove, dbInfo.Id)
 			}
 		}
+		efm.nk.MetricsGaugeSet("edgegap_deployment_count", map[string]string{"namespace": efm.namespace}, float64(activeCount))
 
 		if len(instancesToRemove) > 0 {
 			efm.logger.Debug("Found %d instances to remove", len(instancesToRemove))
@@ -300,14 +307,13 @@ func (efm *EdgegapFleetManager) runCleanupScheduler() {
 
 		if objects := entries.GetObjects(); len(objects) > 0 {
 			efm.logger.Debug("Found %d Reservations Instance to cleanup", len(objects))
-			for _, so := range objects {
-				// Expiry is re-checked on the record as written, so a concurrent Join is not lost.
-				_, err := efm.storageManager.MutateInstance(efm.ctx, so.Key, func(info *runtime.InstanceInfo) error {
-					return efm.storageManager.ExpireReservations(info, searchTime)
-				})
-				if err != nil {
-					efm.logger.WithFields(map[string]any{"instance_id": so.Key, "error": err.Error()}).Error("failed to update expired reservations instance")
-				}
+			// The writes are conditional on the versions the query read, and an instance changed since, by a
+			// concurrent Join for example, has its expiry re-checked on a fresh read so the change is not lost.
+			err := efm.storageManager.MutateInstances(efm.ctx, objects, func(info *runtime.InstanceInfo) error {
+				return efm.storageManager.ExpireReservations(info, searchTime)
+			})
+			if err != nil {
+				efm.logger.WithField("error", err.Error()).Error("failed to update expired reservations instances")
 			}
 		}
 	}

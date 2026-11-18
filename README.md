@@ -129,8 +129,9 @@ Response (no version set):
 
 The `metadata` passed to `Create` can override the global configuration for a single deployment:
 
-- `edgegap_version` - the application version to deploy instead of the version in storage,
-- `edgegap_application` - the Edgegap application to deploy instead of the configured `Application`.
+- `edgegap_version` - the application version to deploy instead of the version in storage.
+
+To deploy a different Edgegap application, register a separate Fleet Manager with `RegisterFleetManagerByName()` and its own `Application` configuration (see [Multiple Fleet Managers](#multiple-fleet-managers)).
 
 ## Usage
 
@@ -380,7 +381,7 @@ RPC - instance_create
 
 Set `max_players` to `0` or `-1` for unlimited. Use with caution, we recommend performing a benchmark for server resource usage impact.
 
-`metadata` can include the [per-deployment overrides](#per-deployment-overrides) `edgegap_version` and `edgegap_application`.
+`metadata` can include the [per-deployment override](#per-deployment-overrides) `edgegap_version`.
 
 If `user_ids` is empty, the requesting user's ID will be used.
 
