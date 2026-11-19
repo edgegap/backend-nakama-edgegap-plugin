@@ -6,18 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
-	"time"
 
 	"github.com/edgegap/nakama-edgegap/internal/helpers"
 	"github.com/heroiclabs/nakama-common/runtime"
 )
 
-const (
-	RpcIdEventDeploymentReady      = "edgegap_deployment_ready"
-	RpcIdEventDeploymentError      = "edgegap_deployment_error"
-	RpcIdEventDeploymentTerminated = "edgegap_deployment_terminated"
-	RpcIdEventConnection           = "edgegap_connection"
-	RpcIdEventInstance             = "edgegap_instance"
+// Event RPC IDs are scoped to the namespace the Fleet Manager was registered with.
+var (
+	RpcIdEventDeploymentReady = func(namespace string) string {
+		return namespaced(namespace, "edgegap_deployment_ready", "deployment_ready")
+	}
+	RpcIdEventDeploymentError = func(namespace string) string {
+		return namespaced(namespace, "edgegap_deployment_error", "deployment_error")
+	}
+	RpcIdEventDeploymentTerminated = func(namespace string) string {
+		return namespaced(namespace, "edgegap_deployment_terminated", "deployment_terminated")
+	}
+	RpcIdEventConnection = func(namespace string) string { return namespaced(namespace, "edgegap_connection", "connection") }
+	RpcIdEventInstance   = func(namespace string) string { return namespaced(namespace, "edgegap_instance", "instance") }
 )
 
 var (
@@ -32,8 +38,7 @@ type EventMessage struct {
 }
 
 type EdgegapEventManager struct {
-	config *EdgegapManagerConfiguration
-	sm     *StorageManager
+	efm *EdgegapFleetManager
 }
 
 // unpack extracts headers and query parameters from the context
@@ -69,23 +74,18 @@ func (eem *EdgegapEventManager) handleDeploymentReadyEvent(ctx context.Context, 
 		return "", err
 	}
 
-	instance, err := eem.sm.getDbInstance(ctx, deployment.RequestId)
+	logger.Info("Edgegap deployment ready #%s", deployment.RequestId)
+
+	_, err = eem.efm.storageManager.MutateInstance(ctx, deployment.RequestId, func(instance *runtime.InstanceInfo) error {
+		return eem.efm.storageManager.ApplyDeploymentReady(instance, &deployment, eem.efm.edgegapManager.configuration.PortName, logger)
+	})
+	if errors.Is(err, ErrInstanceNotFound) {
+		return "", errors.New("no instance found with requestId " + deployment.RequestId)
+	}
 	if err != nil {
 		return "", err
 	}
-	if instance == nil {
-		return "", errors.New("no instance found with requestId " + deployment.RequestId)
-	}
-
-	logger.Info("Edgegap deployment ready #%s", deployment.RequestId)
-	instance.Status = EdgegapStatusRunning
-	instance.ConnectionInfo = &runtime.ConnectionInfo{
-		IpAddress: deployment.PublicIp,
-		DnsName:   deployment.Fqdn,
-		Port:      deployment.Ports[eem.config.PortName].External,
-	}
-
-	return "ok", eem.sm.updateDbInstance(ctx, instance)
+	return "ok", nil
 }
 
 // handleDeploymentErrorEvent processes the deployment "error" webhook from Edgegap.
@@ -102,25 +102,30 @@ func (eem *EdgegapEventManager) handleDeploymentErrorEvent(ctx context.Context, 
 		return "", err
 	}
 
-	instance, err := eem.sm.getDbInstance(ctx, deployment.RequestId)
-	if err != nil {
-		return "", err
-	}
-	if instance == nil {
+	logger.Warn("Edgegap deployment error #%s : %s", deployment.RequestId, deployment.ErrorDetail)
+
+	callbackId := ""
+	_, err = eem.efm.storageManager.MutateInstance(ctx, deployment.RequestId, func(instance *runtime.InstanceInfo) error {
+		instance.Status = EdgegapStatusError
+
+		ei, err := eem.efm.storageManager.ExtractEdgegapInstance(instance)
+		if err != nil {
+			logger.Error("failed to extract edgegap instance for error callback #%s: %v", deployment.RequestId, err)
+			return err
+		}
+		callbackId = ei.CallbackId
+		return nil
+	})
+	if errors.Is(err, ErrInstanceNotFound) {
 		return "", errors.New("no instance found with requestId " + deployment.RequestId)
 	}
-
-	logger.Warn("Edgegap deployment error #%s : %s", deployment.RequestId, deployment.ErrorDetail)
-	instance.Status = EdgegapStatusError
-
-	ei, err := eem.sm.ExtractEdgegapInstance(instance)
 	if err != nil {
-		logger.Error("failed to extract edgegap instance for error callback #%s: %v", deployment.RequestId, err)
+		eem.efm.logger.Error("failed to mark instance as error for deployment %s: %v", deployment.RequestId, err)
 		return "", err
 	}
-	fmInstance.callbackHandler.InvokeCallback(ei.CallbackId, runtime.CreateError, nil, nil, nil, errors.New("an error occurred with edgegap deployment"))
+	eem.efm.callbackHandler.InvokeCallback(callbackId, runtime.CreateError, nil, nil, nil, errors.New("an error occurred with edgegap deployment"))
 
-	return "ok", eem.sm.updateDbInstance(ctx, instance)
+	return "ok", nil
 }
 
 // handleDeploymentTerminatedEvent processes the deployment "terminated" webhook from Edgegap.
@@ -136,18 +141,19 @@ func (eem *EdgegapEventManager) handleDeploymentTerminatedEvent(ctx context.Cont
 		return "", err
 	}
 
-	instance, err := eem.sm.getDbInstance(ctx, deployment.RequestId)
+	logger.Info("Edgegap deployment terminated #%s", deployment.RequestId)
+
+	_, err = eem.efm.storageManager.MutateInstance(ctx, deployment.RequestId, func(instance *runtime.InstanceInfo) error {
+		instance.Status = EdgegapStatusTerminated
+		return nil
+	})
+	if errors.Is(err, ErrInstanceNotFound) {
+		return "", errors.New("no instance found with requestId " + deployment.RequestId)
+	}
 	if err != nil {
 		return "", err
 	}
-	if instance == nil {
-		return "", errors.New("no instance found with requestId " + deployment.RequestId)
-	}
-
-	logger.Info("Edgegap deployment terminated #%s", deployment.RequestId)
-	instance.Status = EdgegapStatusTerminated
-
-	return "ok", eem.sm.updateDbInstance(ctx, instance)
+	return "ok", nil
 }
 
 // handleConnectionEvent processes connection-related events.
@@ -163,28 +169,12 @@ func (eem *EdgegapEventManager) handleConnectionEvent(ctx context.Context, logge
 		return "", err
 	}
 
-	instance, err := eem.sm.getDbInstance(ctx, connectionEvent.InstanceId)
-	if err != nil {
-		return "", err
-	}
-
-	if instance == nil {
+	_, err = eem.efm.storageManager.MutateInstance(ctx, connectionEvent.InstanceId, func(instance *runtime.InstanceInfo) error {
+		return eem.efm.storageManager.ApplyConnectionReport(instance, connectionEvent.Connections)
+	})
+	if errors.Is(err, ErrInstanceNotFound) {
 		return "", errors.New("no instance found with instanceId " + connectionEvent.InstanceId)
 	}
-
-	edgegapInstance, err := eem.sm.ExtractEdgegapInstance(instance)
-	if err != nil {
-		return "", err
-	}
-
-	// We want to move all reservations present in the Connections List
-	newReservations := helpers.RemoveElements(edgegapInstance.Reservations, connectionEvent.Connections)
-	edgegapInstance.Reservations = newReservations
-	edgegapInstance.Connections = connectionEvent.Connections
-	edgegapInstance.ReservationsUpdatedAt = time.Now().UTC()
-	instance.Metadata["edgegap"] = edgegapInstance
-
-	err = eem.sm.updateDbInstance(ctx, instance)
 	if err != nil {
 		return "", err
 	}
@@ -205,47 +195,42 @@ func (eem *EdgegapEventManager) handleInstanceEvent(ctx context.Context, logger 
 		return "", err
 	}
 
-	instance, err := eem.sm.getDbInstance(ctx, instanceEvent.InstanceId)
-	if err != nil {
-		return "", err
-	}
-
-	if instance == nil {
-		return "", errors.New("no instance found with instanceId " + instanceEvent.InstanceId)
-	}
-
-	stopping := false
-	readyCallbackId := ""
-
-	switch strings.ToUpper(instanceEvent.Action) {
+	// Log and resolve the status outside the mutation, which may be retried on version conflicts.
+	action := strings.ToUpper(instanceEvent.Action)
+	var status string
+	switch action {
 	case InstanceEventStateReady:
 		logger.Info("Edgegap instance ready id=%s : %s", instanceEvent.InstanceId, instanceEvent.Message)
-		instance.Status = EdgegapStatusReady
-
-		// Extract new Metadata coming from the Instance Server and merge it with current
-		instance.Metadata = helpers.MergeMaps(instance.Metadata, instanceEvent.Metadata)
-
-		ei, err := eem.sm.ExtractEdgegapInstance(instance)
-		if err != nil {
-			return "", err
-		}
-		readyCallbackId = ei.CallbackId
-
+		status = EdgegapStatusReady
 	case InstanceEventStateStop:
 		logger.Info("Edgegap instance stop #%s: %s", instanceEvent.InstanceId, instanceEvent.Message)
-		instance.Status = EdgegapStatusStopping
-		stopping = true
-
+		status = EdgegapStatusStopping
 	case InstanceEventStateError:
 		logger.Error("Edgegap instance state error #%s: %s", instanceEvent.InstanceId, instanceEvent.Message)
-		instance.Status = EdgegapStatusError
-
+		status = EdgegapStatusError
 	default:
 		logger.Error("Unknown action #%s: %s", instanceEvent.Action, instanceEvent.Message)
-		instance.Status = EdgegapStatusUnknown
+		status = EdgegapStatusUnknown
 	}
 
-	err = eem.sm.updateDbInstance(ctx, instance)
+	readyCallbackId := ""
+	instance, err := eem.efm.storageManager.MutateInstance(ctx, instanceEvent.InstanceId, func(instance *runtime.InstanceInfo) error {
+		instance.Status = status
+		if action == InstanceEventStateReady {
+			// Extract new Metadata coming from the Instance Server and merge it with current
+			instance.Metadata = helpers.MergeMaps(instance.Metadata, instanceEvent.Metadata)
+
+			ei, err := eem.efm.storageManager.ExtractEdgegapInstance(instance)
+			if err != nil {
+				return err
+			}
+			readyCallbackId = ei.CallbackId
+		}
+		return nil
+	})
+	if errors.Is(err, ErrInstanceNotFound) {
+		return "", errors.New("no instance found with instanceId " + instanceEvent.InstanceId)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -255,11 +240,11 @@ func (eem *EdgegapEventManager) handleInstanceEvent(ctx context.Context, logger 
 	// the callback may query instance_list and read a stale record that is
 	// still missing the game_server fields, causing empty connection info.
 	if readyCallbackId != "" {
-		fmInstance.callbackHandler.InvokeCallback(readyCallbackId, runtime.CreateSuccess, instance, nil, nil, nil)
+		eem.efm.callbackHandler.InvokeCallback(readyCallbackId, runtime.CreateSuccess, instance, nil, nil, nil)
 	}
 
-	if stopping {
-		_, err := fmInstance.edgegapManager.StopDeployment(instanceEvent.InstanceId)
+	if action == InstanceEventStateStop {
+		_, err := eem.efm.edgegapManager.StopDeployment(instanceEvent.InstanceId)
 		if err != nil {
 			return "", err
 		}

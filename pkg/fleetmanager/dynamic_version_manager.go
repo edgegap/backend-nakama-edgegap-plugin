@@ -13,14 +13,19 @@ import (
 	"github.com/heroiclabs/nakama-common/runtime"
 )
 
-const (
-	RpcIdUpdateEdgegapVersion = "update_edgegap_version"
-	RpcIdGetEdgegapVersion    = "get_edgegap_version"
+// Version RPC IDs are scoped to the namespace the Fleet Manager was registered with.
+var (
+	RpcIdUpdateEdgegapVersion = func(namespace string) string {
+		return namespaced(namespace, "update_edgegap_version", "update_version")
+	}
+	RpcIdGetEdgegapVersion = func(namespace string) string { return namespaced(namespace, "get_edgegap_version", "get_version") }
+)
 
+const (
 	// Error messages
 	ErrorMessageUnauthorized        = "unauthorized: this RPC requires server authentication"
 	ErrorMessageNoVersionConfigured = "No Edgegap version configured"
-	ErrorMessageSetVersionRPC       = "Please set version using update_edgegap_version RPC"
+	ErrorMessageSetVersionRPC       = "Please set version using %s RPC"
 
 	// Log messages
 	LogMessageStoringInitialVersion = "No version found in storage, storing initial version: %s"
@@ -38,44 +43,48 @@ type UpdateEdgegapVersionRequest struct {
 	Version string `json:"version"`
 }
 
-// DynamicVersionManager manages dynamic versioning for Edgegap deployments
-type DynamicVersionManager struct {
-	config *EdgegapManagerConfiguration
-	sm     *StorageManager
-	logger runtime.Logger
+// dynamicVersionManager manages dynamic versioning for Edgegap deployments
+type dynamicVersionManager struct {
+	config    *EdgegapConfig
+	sm        *StorageManager
+	logger    runtime.Logger
+	namespace string
 }
 
-// NewDynamicVersionManager creates a new DynamicVersionManager instance
-func NewDynamicVersionManager(config *EdgegapManagerConfiguration, sm *StorageManager, logger runtime.Logger) *DynamicVersionManager {
-	dvm := &DynamicVersionManager{
+// newDynamicVersionManager creates a new dynamicVersionManager instance
+func newDynamicVersionManager(config *EdgegapConfig, sm *StorageManager, logger runtime.Logger) *dynamicVersionManager {
+	return &dynamicVersionManager{
 		config: config,
 		sm:     sm,
 		logger: logger,
 	}
+}
 
-	// Check if initial version should be stored at startup
-	if config.InitialVersion != "" {
-		ctx := context.Background()
-		// Check if a version is already stored
-		_, _, err := sm.ReadEdgegapVersion(ctx)
-		if err != nil {
-			if errors.Is(err, ErrorNoVersionFound) {
-				// No version in storage, store the initial version
-				logger.Info(LogMessageStoringInitialVersion, config.InitialVersion)
-				if err := sm.WriteEdgegapVersion(ctx, config.InitialVersion); err != nil {
-					logger.Warn(LogMessageFailedStoreInitial, err)
-				}
-			} else {
-				logger.Warn(LogMessageFailedCheckVersion, err)
-			}
-		}
+// init scopes the version to the Fleet Manager namespace and stores the initial version if none is stored yet.
+func (dvm *dynamicVersionManager) init(ctx context.Context, namespace string) {
+	dvm.namespace = namespace
+
+	if dvm.config.InitialVersion == "" {
+		return
 	}
 
-	return dvm
+	// Check if a version is already stored
+	_, _, err := dvm.sm.ReadEdgegapVersion(ctx)
+	if err != nil {
+		if errors.Is(err, ErrorNoVersionFound) {
+			// No version in storage, store the initial version
+			dvm.logger.Info(LogMessageStoringInitialVersion, dvm.config.InitialVersion)
+			if err := dvm.sm.WriteEdgegapVersion(ctx, dvm.config.InitialVersion); err != nil {
+				dvm.logger.Warn(LogMessageFailedStoreInitial, err)
+			}
+		} else {
+			dvm.logger.Warn(LogMessageFailedCheckVersion, err)
+		}
+	}
 }
 
 // ValidateVersionWithEdgegap validates that a version exists in Edgegap
-func (dvm *DynamicVersionManager) ValidateVersionWithEdgegap(version string) error {
+func (dvm *dynamicVersionManager) ValidateVersionWithEdgegap(version string) error {
 	apiHelper := helpers.NewAPIClient(dvm.config.ApiUrl, dvm.config.ApiToken)
 	reply, err := apiHelper.Get(fmt.Sprintf("/v1/app/%s/version/%s", dvm.config.Application, version))
 	if err != nil {
@@ -99,7 +108,7 @@ func (dvm *DynamicVersionManager) ValidateVersionWithEdgegap(version string) err
 // - 7 (PERMISSION_DENIED) → 403 Forbidden
 // - 9 (FAILED_PRECONDITION) → 400 Bad Request
 // - 13 (INTERNAL) → 500 Internal Server Error
-func (dvm *DynamicVersionManager) UpdateEdgegapVersion(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (dvm *dynamicVersionManager) UpdateEdgegapVersion(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 	// This RPC should only be called by servers with HTTP key authentication, not by game clients
 	// Nakama automatically validates the HTTP key when the Authorization header is provided
 	// If we reach this point with a user ID, it means a client is trying to call this RPC
@@ -148,7 +157,7 @@ func (dvm *DynamicVersionManager) UpdateEdgegapVersion(ctx context.Context, logg
 }
 
 // GetEdgegapVersion retrieves the current Edgegap version configuration (S2S only)
-func (dvm *DynamicVersionManager) GetEdgegapVersion(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
+func (dvm *dynamicVersionManager) GetEdgegapVersion(ctx context.Context, logger runtime.Logger, db *sql.DB, nk runtime.NakamaModule, payload string) (string, error) {
 	// This RPC can be called by servers with HTTP key authentication
 	// If we reach this point with a user ID, it means a client is trying to call this RPC
 	if _, ok := ctx.Value(runtime.RUNTIME_CTX_USER_ID).(string); ok {
@@ -164,7 +173,7 @@ func (dvm *DynamicVersionManager) GetEdgegapVersion(ctx context.Context, logger 
 		if errors.Is(err, ErrorNoVersionFound) {
 			// No version set yet
 			response["error"] = ErrorMessageNoVersionConfigured
-			response["message"] = ErrorMessageSetVersionRPC
+			response["message"] = fmt.Sprintf(ErrorMessageSetVersionRPC, RpcIdUpdateEdgegapVersion(dvm.namespace))
 		} else {
 			logger.Error("Failed to read Edgegap version from storage: %v", err)
 			return "", runtime.NewError(fmt.Sprintf("failed to read Edgegap version: %v", err), 13) // INTERNAL
